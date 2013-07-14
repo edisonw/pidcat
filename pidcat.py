@@ -29,17 +29,19 @@ import subprocess
 from subprocess import PIPE
 
 
-LOG_LEVELS = ['V','D','I','W','E']
+LOG_LEVELS = 'VDIWEF'
 LOG_LEVELS_MAP = dict([(LOG_LEVELS[i], i) for i in range(len(LOG_LEVELS))])
 parser = argparse.ArgumentParser(description='Filter logcat by package name')
 parser.add_argument('package', nargs='+', help='Application package name(s)')
 parser.add_argument('-w', '--tag-width', metavar='N', dest='tag_width', type=int, default=22, help='Width of log tag')
 parser.add_argument('-l', '--min-level', dest='min_level', type=str, choices=LOG_LEVELS, default='V', help='Minimum level to be displayed')
 parser.add_argument('--color-gc', dest='color_gc', action='store_true', help='Color garbage collection')
-parser.add_argument('--terminal-width', dest='terminal_width', type=int, help='Default a terminal width. Required for piping to sources other than a real screen.')
+parser.add_argument('-s', '--serial', dest='device_serial', help='Device serial number (adb -s option)')
+parser.add_argument('-d', '--device', dest='use_device', action='store_true', help='Use first device for log input (adb -d option).')
+parser.add_argument('-e', '--emulator', dest='use_emulator', action='store_true', help='Use first emulator for log input (adb -e option).')
 
 args = parser.parse_args()
-min_level=LOG_LEVELS_MAP[args.min_level]
+min_level = LOG_LEVELS_MAP[args.min_level]
 
 header_size = args.tag_width + 1 + 3 + 1 # space, level, space
 
@@ -130,14 +132,22 @@ TAGTYPES = {
   'F': colorize(' F ', fg=BLACK, bg=RED),
 }
 
-PID_START = re.compile(r'^Start proc ([a-zA-Z0-9._:]+) for ([a-z]+ [^:]+): pid=(\d+) uid=(\d+) gids=(.*)\r?$')
-PID_KILL  = re.compile(r'^Killing (\d+):([a-zA-Z0-9._]+)/[^:]+: (.*)\r?$')
-PID_LEAVE = re.compile(r'^No longer want ([a-zA-Z0-9._]+) \(pid (\d+)\): .*\r?$')
-PID_DEATH = re.compile(r'^Process ([a-zA-Z0-9._]+) \(pid (\d+)\) has died.?\r$')
-LOG_LINE  = re.compile(r'^([A-Z])/([^\(]+)\( *(\d+)\): (.*?)\r?$')
-BUG_LINE  = re.compile(r'^(?!.*(nativeGetEnabledTags)).*$')
+PID_START = re.compile(r'^Start proc ([a-zA-Z0-9._:]+) for ([a-z]+ [^:]+): pid=(\d+) uid=(\d+) gids=(.*)$')
+PID_KILL  = re.compile(r'^Killing (\d+):([a-zA-Z0-9._]+)/[^:]+: (.*)$')
+PID_LEAVE = re.compile(r'^No longer want ([a-zA-Z0-9._]+) \(pid (\d+)\): .*$')
+PID_DEATH = re.compile(r'^Process ([a-zA-Z0-9._]+) \(pid (\d+)\) has died.?$')
+LOG_LINE  = re.compile(r'^([A-Z])/(.+?)\( *(\d+)\): (.*?)$')
+BUG_LINE  = re.compile(r'.*nativeGetEnabledTags.*')
 
-adb_command = ['adb', 'logcat']
+adb_command = ['adb']
+if args.device_serial:
+  adb_command.extend(['-s', args.device_serial])
+if args.use_device:
+  adb_command.append('-d')
+if args.use_emulator:
+  adb_command.append('-e')
+adb_command.append('logcat')
+
 adb = subprocess.Popen(adb_command, stdin=PIPE, stdout=PIPE, stderr=PIPE)
 pids = set()
 last_tag = None
@@ -168,73 +178,75 @@ def parse_death(tag, message):
 
 while adb.poll() is None:
   try:
-    line = adb.stdout.readline()
+    line = adb.stdout.readline().decode('utf-8').strip()
   except KeyboardInterrupt:
     break
   if len(line) == 0:
     break
 
   bug_line = BUG_LINE.match(line)
-  if bug_line is None:
+  if bug_line is not None:
     continue
 
   log_line = LOG_LINE.match(line)
-  if not log_line is None:
-    level, tag, owner, message = log_line.groups()
+  if log_line is None:
+    continue
 
-    start = PID_START.match(message)
-    if start is not None:
-      line_package, target, line_pid, line_uid, line_gids = start.groups()
+  level, tag, owner, message = log_line.groups()
 
-      if match_packages(line_package):
-        pids.add(line_pid)
+  start = PID_START.match(message)
+  if start is not None:
+    line_package, target, line_pid, line_uid, line_gids = start.groups()
 
-        linebuf  = '\n'
-        linebuf += colorize(' ' * (header_size - 1), bg=WHITE)
-        linebuf += indent_wrap(' Process created for %s\n' % target)
-        linebuf += colorize(' ' * (header_size - 1), bg=WHITE)
-        linebuf += ' PID: %s   UID: %s   GIDs: %s' % (line_pid, line_uid, line_gids)
-        linebuf += '\n'
-        print(linebuf)
-        last_tag = None # Ensure next log gets a tag printed
+    if match_packages(line_package):
+      pids.add(line_pid)
 
-    dead_pid = parse_death(tag, message)
-    if dead_pid:
-      pids.remove(dead_pid)
       linebuf  = '\n'
-      linebuf += colorize(' ' * (header_size - 1), bg=RED)
-      linebuf += ' Process %s ended' % dead_pid
+      linebuf += colorize(' ' * (header_size - 1), bg=WHITE)
+      linebuf += indent_wrap(' Process created for %s\n' % target)
+      linebuf += colorize(' ' * (header_size - 1), bg=WHITE)
+      linebuf += ' PID: %s   UID: %s   GIDs: %s' % (line_pid, line_uid, line_gids)
       linebuf += '\n'
       print(linebuf)
       last_tag = None # Ensure next log gets a tag printed
 
-    if owner not in pids:
-      continue
-    if LOG_LEVELS_MAP[level] < min_level: 
-      continue
-
-    linebuf = ''
-
-    # right-align tag title and allocate color if needed
-    tag = tag.strip()
-    if tag != last_tag:
-      last_tag = tag
-      color = allocate_color(tag)
-      tag = tag[-args.tag_width:].rjust(args.tag_width)
-      linebuf += colorize(tag, fg=color)
-    else:
-      linebuf += ' ' * args.tag_width
-    linebuf += ' '
-
-    # write out level colored edge
-    if level not in TAGTYPES: break
-    linebuf += TAGTYPES[level]
-    linebuf += ' '
-
-    # format tag message using rules
-    for matcher in RULES:
-      replace = RULES[matcher]
-      message = matcher.sub(replace, message)
-
-    linebuf += indent_wrap(message)
+  dead_pid = parse_death(tag, message)
+  if dead_pid:
+    pids.remove(dead_pid)
+    linebuf  = '\n'
+    linebuf += colorize(' ' * (header_size - 1), bg=RED)
+    linebuf += ' Process %s ended' % dead_pid
+    linebuf += '\n'
     print(linebuf)
+    last_tag = None # Ensure next log gets a tag printed
+
+  if owner not in pids:
+    continue
+  if LOG_LEVELS_MAP[level] < min_level:
+    continue
+
+  linebuf = ''
+
+  # right-align tag title and allocate color if needed
+  tag = tag.strip()
+  if tag != last_tag:
+    last_tag = tag
+    color = allocate_color(tag)
+    tag = tag[-args.tag_width:].rjust(args.tag_width)
+    linebuf += colorize(tag, fg=color)
+  else:
+    linebuf += ' ' * args.tag_width
+  linebuf += ' '
+
+  # write out level colored edge
+  if level not in TAGTYPES: break
+  linebuf += TAGTYPES[level]
+  linebuf += ' '
+
+  # format tag message using rules
+  for matcher in RULES:
+    replace = RULES[matcher]
+    message = matcher.sub(replace, message)
+
+  linebuf += indent_wrap(message)
+  print(linebuf)
